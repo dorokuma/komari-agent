@@ -69,3 +69,13 @@ export AGENT_TOKEN="your-token"
 ```
 
 详见 `cmd/flags/flags.go` 及 `cmd/root.go`
+
+## Commit 规范
+
+提交信息须遵循 Conventional Commits 规范（`TYPE: 主题` 或 `TYPE(scope): 主题`）：
+
+- **Type 白名单**：`feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`（小写）
+- **Scope**：可选（`[a-z0-9._-]+`）
+- **主题**：非空，≤ 72 字符（允许中英文混合）
+- **豁免**：Merge, revert, `fixup!`, `squash!` 提交
+- **门禁**：本机 `commit-msg` hook 自动校验格式，并包含密钥扫描与噪声词拦截。
