@@ -1,5 +1,12 @@
 # komari-agent
 
+## Development conventions
+
+- Build: `go build ./...` (or `bash build_all.sh`)
+- Test: `go test ./...`
+- Vet: `go vet ./...`
+- Commits: Conventional Commits (types `feat/fix/docs/style/refactor/perf/test/build/ci/chore/revert`), subject ≤72 chars, exactly one space after the colon.
+
 ## 配置方式
 
 agent 参数可以通过命令行参数、环境变量或 JSON 配置文件传入。

@@ -229,6 +229,7 @@ func NetworkSpeed() (totalUp, totalDown, upSpeed, downSpeed uint64, err error) {
 		if err != nil {
 			// 如果netstatic失败，回退到原来的方法，并返回额外的错误信息
 			fallbackUp, fallbackDown, fallbackUpSpeed, fallbackDownSpeed, fallbackErr := getNetworkSpeedFallback(includeNics, excludeNics)
+			fallbackUp, fallbackDown = applyTrafficOffset(fallbackUp, fallbackDown)
 			if fallbackErr != nil {
 				return fallbackUp, fallbackDown, fallbackUpSpeed, fallbackDownSpeed, fmt.Errorf("failed to call GetTotalTrafficBetween: %v; fallback error: %w", err, fallbackErr)
 			}
@@ -245,14 +246,20 @@ func NetworkSpeed() (totalUp, totalDown, upSpeed, downSpeed uint64, err error) {
 		// 对于实时速度，仍然使用网卡累计计数器差值
 		_, _, upSpeed, downSpeed, err = getNetworkSpeedFallback(includeNics, excludeNics)
 		if err != nil {
+			totalUp, totalDown = applyTrafficOffset(totalUp, totalDown)
 			return totalUp, totalDown, 0, 0, err
 		}
 
+		totalUp, totalDown = applyTrafficOffset(totalUp, totalDown)
 		return totalUp, totalDown, upSpeed, downSpeed, nil
 	}
 
 	// 如果没有设置月重置，使用原来的方法
-	return getNetworkSpeedFallback(includeNics, excludeNics)
+	totalUp, totalDown, upSpeed, downSpeed, err = getNetworkSpeedFallback(includeNics, excludeNics)
+	if err == nil {
+		totalUp, totalDown = applyTrafficOffset(totalUp, totalDown)
+	}
+	return totalUp, totalDown, upSpeed, downSpeed, err
 }
 
 func getNetworkSpeedFallback(includeNics, excludeNics map[string]struct{}) (totalUp, totalDown, upSpeed, downSpeed uint64, err error) {
