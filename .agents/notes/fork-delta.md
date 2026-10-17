@@ -41,11 +41,12 @@ supersedes: ""
 4. **提交信息规范**
    - 提交 `02a1ed1`：在 `readme.md` 补充 Conventional Commits 与 commit-msg 校验门禁说明。
 5. **后续合并策略**
-   - 待维护者确认：上述定制项是否向上游提交 PR 或保持为独立维护分支。
+   - 已确认决策：长期自维护，不向上游提交 PR；同步方式为定期 merge/rebase 上游后在自维护分支重放定制项（LXC cgroup v2 CPU 监控与 `/opt/komari/traffic-offset` 流量补偿、基线保护与热更新回退处理）；`readme.md` 保持上游原貌以减少同步冲突，运维说明按需增补（该条保留为观察项、不阻断）。
 
 ## 被放弃的方案（必填）
 
 - **完全覆盖上游而不记录分歧**：会导致后续上游同步 (upstream merge/rebase) 时丢失定制上下文和冲突成因。
+- **向上游提 PR**：定制强依赖本部署形态的 LXC/cgroup v2 与本地流量补偿挂载，与上游通用监控场景不一致，且上游 review 周期不可控。
 
 ## 来源
 
