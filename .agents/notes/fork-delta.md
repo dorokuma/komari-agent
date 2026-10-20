@@ -24,7 +24,7 @@ supersedes: ""
    - 改动：
      - **容器/配额启用门禁**：仅当存在容器环境特征（marker 文件仅保留 `/.dockerenv` 与 `/run/.containerenv`，移除 `/dev/lxc` 以免 Proxmox/LXC 宿主机因存在 `/dev/lxc/monitor` 等设备目录被误判；`/proc/1/environ` 含 `container=` 且等号右侧非空；或 `/proc/self/cgroup` 的 `0::` 路径经 `isContainerCgroupPath` 判定：先排除 `/` 与 `/init.scope`，再逐段扫描并跳过 `.service` 段（如宿主机的 `/system.slice/docker.service`、`/system.slice/lxc.service`、`/system.slice/lxcfs.service`），任一非 `.service` 段匹配 `lxc`、`lxc.payload.*`、`lxc.monitor.*`、`docker`、`docker-*.scope`、`kubepods`、`kubepods.slice`、`containerd`、`libpod`、`machine-lxc*` 等容器特征即启用，兼顾容器内 systemd 运行的 `/lxc.payload.ct101/init.scope` 与 `/lxc.payload.ct101/system.slice/komari-agent.service` 等嵌套路径）或 `/sys/fs/cgroup/cpu.max` 显式配置了非 `max` 的有限配额，且 `/sys/fs/cgroup/cpu.stat` 可读时，才启用 `cpuUsageFromCgroup`，避免普通 cgroup v2 物理宿主机误入而报 0% 或错误按 `cpu/online` 除算。
      - **基线保护与热更新/回退处理**：在 `cgroupMu` 下记录 `lastCgroupNCPU`；当 `usage < lastCgroupUsage`（计数器重置回退）或 `cpu.max` 配额热更新时重播种采样基线，且计数器回退时置 `haveCgroupPct = false` 并返回 `0, false`；当 `readCgroupUsageUsec()` 或 `cgroupCPULimit()` 瞬时读取失败时作废 `haveCgroupSample`，防止故障恢复后将漫长故障间隔稀释进单次采样。
-     - **审查观察项（设计权衡）**：`Cpu()` 每轮询周期执行 `cgroupCPUStatAvailable()`（含 marker 与 `/proc` 轻量读）属每秒一次级微小开销，暂不引入 `sync.Once` 缓存以保持单测路径变量可动态切换；`readme.md` 运维说明后续可按需增补。
+     - **审查观察项（设计权衡）**：`Cpu()` 每轮询周期执行 `cgroupCPUStatAvailable()`（含 marker 与 `/proc` 轻量读）属每秒一次级微小开销，暂不引入 `sync.Once` 缓存以保持单测路径变量可动态切换。
 2. **流量偏移补偿机制 (Traffic Offset)**
    - 模块：`monitoring/unit`（`net.go`, `traffic_offset.go`, `traffic_offset_test.go`）
    - 改动：
@@ -35,13 +35,13 @@ supersedes: ""
        - 偏移文件中的 `reset_day` 优先于面板 `flags.MonthRotate`，运维配置时须与面板月重置日保持一致；
        - `net.go:232-237` 在 `MonthRotate != 0` 且双失败回退 `(0,0)` 时叠加偏移、而 `MonthRotate == 0` 错误路径直返 `(0,0)` 的现状说明（调用方在 `err != nil` 时知悉该边界）；
        - 上游既有 `monitoring/unit/net_test.go`（如 `TestNetworkSpeedWithoutMonthRotate`）存在直接修改全局 `flags.MonthRotate = 1` 且未恢复的历史问题，为避免污染与上游无关的测试文件暂不改动，新增 `traffic_offset_test.go` 单测均通过 `t.Cleanup` 严格保存并恢复全局配置；
-       - `readme.md` 关于 `/opt/komari/traffic-offset` 与 LXC cgroup v2 CPU 监控的运维说明后续可增补（当前保持上游 README 结构以减少同步冲突）。
+       - 保持上游 README 结构以减少同步冲突。
 3. **安全凭证清理**
    - 提交 `8cd9214`：移除配置中的 Cloudflare Access 凭证。
 4. **提交信息规范**
    - 提交 `02a1ed1`：在 `readme.md` 补充 Conventional Commits 与 commit-msg 校验门禁说明。
 5. **后续合并策略**
-   - 已确认决策：长期自维护，不向上游提交 PR；同步方式为定期 merge/rebase 上游后在自维护分支重放定制项（LXC cgroup v2 CPU 监控与 `/opt/komari/traffic-offset` 流量补偿、基线保护与热更新回退处理）；`readme.md` 保持上游原貌以减少同步冲突，运维说明按需增补（该条保留为观察项、不阻断）。
+   - 已确认决策：长期自维护，不向上游提交 PR；同步方式为定期 merge/rebase 上游后在自维护分支重放定制项（LXC cgroup v2 CPU 监控与 `/opt/komari/traffic-offset` 流量补偿、基线保护与热更新回退处理）；`readme.md` 保持上游原貌以减少同步冲突。
 
 ## 被放弃的方案（必填）
 
