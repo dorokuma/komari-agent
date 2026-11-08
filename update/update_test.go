@@ -1,10 +1,33 @@
 package update
 
 import (
+	"errors"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/blang/semver"
+	"github.com/rhysd/go-github-selfupdate/selfupdate"
 )
+
+type fakeSelfUpdater struct {
+	detectLatest  func(string) (*selfupdate.Release, bool, error)
+	updateTo      func(*selfupdate.Release, string) error
+	updateToCalls int
+}
+
+func (f *fakeSelfUpdater) DetectLatest(slug string) (*selfupdate.Release, bool, error) {
+	return f.detectLatest(slug)
+}
+
+func (f *fakeSelfUpdater) UpdateTo(release *selfupdate.Release, cmdPath string) error {
+	f.updateToCalls++
+	if f.updateTo == nil {
+		return nil
+	}
+	return f.updateTo(release, cmdPath)
+}
 
 // TestParseVersion 验证 parseVersion 能够解析各种版本号格式，包括带 v/V 前缀、预发布和构建元数据
 func TestParseVersion(t *testing.T) {
@@ -177,6 +200,175 @@ func TestSnapshotNeedsUpdate(t *testing.T) {
 	}
 	if !snapshotNeedsUpdate("Snapshot-2607061100", latest) {
 		t.Errorf("snapshotNeedsUpdate() should be true for an older snapshot tag")
+	}
+}
+
+func TestStableUpdateReturnsRestartRequired(t *testing.T) {
+	current := semver.MustParse("1.2.3")
+	hookCalls := 0
+	RegisterPreExitHook(func() { hookCalls++ })
+	t.Cleanup(func() { RegisterPreExitHook(nil) })
+
+	latest := &selfupdate.Release{Version: semver.MustParse("1.2.4")}
+	updater := &fakeSelfUpdater{
+		detectLatest: func(gotRepo string) (*selfupdate.Release, bool, error) {
+			if gotRepo != Repo {
+				t.Fatalf("DetectLatest repo = %q, want %q", gotRepo, Repo)
+			}
+			return latest, true, nil
+		},
+		updateTo: func(gotRelease *selfupdate.Release, gotPath string) error {
+			if gotRelease != latest {
+				t.Fatalf("UpdateTo release = %+v, want the detected release %+v", gotRelease, latest)
+			}
+			if gotPath != "/tmp/fake-agent" {
+				t.Fatalf("UpdateTo path = %q, want injected executable path", gotPath)
+			}
+			return nil
+		},
+	}
+
+	err := checkAndUpdateStable(current, updater, func() (string, error) { return "/tmp/fake-agent", nil })
+	if !errors.Is(err, ErrRestartRequired) {
+		t.Fatalf("checkAndUpdateStable() error = %v, want ErrRestartRequired", err)
+	}
+	if updater.updateToCalls != 1 {
+		t.Fatalf("UpdateTo calls = %d, want 1", updater.updateToCalls)
+	}
+	if hookCalls != 1 {
+		t.Fatalf("pre-exit hook calls = %d, want 1", hookCalls)
+	}
+}
+
+// TestStableNoDowngrade 验证 latest <= current（含相等、仅构建元数据不同、
+// 本地 dev/高版本）时 checkAndUpdateStable 不调用 UpdateTo、不触发重启钩子。
+func TestStableNoDowngrade(t *testing.T) {
+	tests := []struct {
+		name    string
+		current string
+		latest  string
+	}{
+		{"equal-ignores-build-meta", "1.5.11-fork.1+g0123456", "1.5.11-fork.1"},
+		{"dev-build-newer-than-release", "1.5.11-fork.1.dev.g0123456", "1.5.11-fork.1"},
+		{"local-newer-base-version", "1.5.12-fork.1", "1.5.11-fork.2"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hookCalls := 0
+			RegisterPreExitHook(func() { hookCalls++ })
+			t.Cleanup(func() { RegisterPreExitHook(nil) })
+
+			updater := &fakeSelfUpdater{
+				detectLatest: func(slug string) (*selfupdate.Release, bool, error) {
+					return &selfupdate.Release{Version: semver.MustParse(tt.latest)}, true, nil
+				},
+			}
+
+			err := checkAndUpdateStable(semver.MustParse(tt.current), updater, func() (string, error) {
+				t.Fatal("execPathFn must not be called when no update is needed")
+				return "", nil
+			})
+			if err != nil {
+				t.Fatalf("checkAndUpdateStable() error = %v, want nil", err)
+			}
+			if updater.updateToCalls != 0 {
+				t.Fatalf("UpdateTo calls = %d, want 0 (no downgrade)", updater.updateToCalls)
+			}
+			if hookCalls != 0 {
+				t.Fatalf("pre-exit hook calls = %d, want 0", hookCalls)
+			}
+		})
+	}
+}
+
+func TestSnapshotUpdateReturnsRestartRequired(t *testing.T) {
+	oldVersion := CurrentVersion
+	CurrentVersion = "Snapshot-2607061100"
+	t.Cleanup(func() { CurrentVersion = oldVersion })
+
+	assetName := expectedAssetName(runtime.GOOS, runtime.GOARCH)
+	release := testRelease("Snapshot-2607061200", true, false, time.Now(), assetName)
+	updater := &fakeSelfUpdater{
+		updateTo: func(gotRelease *selfupdate.Release, gotPath string) error {
+			if gotRelease.AssetURL != release.Assets[0].BrowserDownloadURL {
+				t.Fatalf("UpdateTo asset = %q, want %q", gotRelease.AssetURL, release.Assets[0].BrowserDownloadURL)
+			}
+			if gotPath == "" {
+				t.Fatal("UpdateTo received an empty executable path")
+			}
+			return nil
+		},
+	}
+	lister := func(owner, repo string) ([]githubRelease, error) {
+		if owner != "dorokuma" || repo != "komari-agent" {
+			t.Fatalf("list releases repo = %s/%s, want dorokuma/komari-agent", owner, repo)
+		}
+		return []githubRelease{release}, nil
+	}
+
+	if err := checkAndUpdateSnapshot(updater, lister, func() bool { return false }); !errors.Is(err, ErrRestartRequired) {
+		t.Fatalf("checkAndUpdateSnapshot() error = %v, want ErrRestartRequired", err)
+	}
+}
+
+func TestScheduledUpdateStopsAfterRestartRequired(t *testing.T) {
+	ticks := make(chan time.Time, 3)
+	ticks <- time.Now()
+	ticks <- time.Now()
+	ticks <- time.Now()
+
+	checks := 0
+	restarts := 0
+	runScheduledUpdates(
+		ticks,
+		func() error {
+			checks++
+			if checks == 1 {
+				return errors.New("transient update check failure")
+			}
+			return ErrRestartRequired
+		},
+		func() { restarts++ },
+	)
+
+	if checks != 2 {
+		t.Fatalf("scheduled checks = %d, want 2", checks)
+	}
+	if restarts != 1 {
+		t.Fatalf("restart handoffs = %d, want 1", restarts)
+	}
+}
+
+// TestParseVersionForkBuilds 验证 build_all.sh 注入的我方 Fork 版本号格式
+// （含纯数字前导零短 SHA 经 g 前缀合法化的用例）均可被 parseVersion 解析，
+// 且 v<upstream>-fork.<N> 相对上游同版本为合法预发布低版本。
+func TestParseVersionForkBuilds(t *testing.T) {
+	inputs := []string{
+		"1.5.11-fork.g0123456",
+		"1.5.11-fork.1+g0123456",
+		"1.5.11-fork.1.dev.g0123456",
+	}
+	for _, in := range inputs {
+		if _, err := parseVersion(in); err != nil {
+			t.Errorf("parseVersion(%q) unexpected error: %v", in, err)
+		}
+	}
+
+	forkRel, err := parseVersion("1.5.11-fork.1")
+	if err != nil {
+		t.Fatalf("parseVersion fork release error: %v", err)
+	}
+	upstream, err := parseVersion("1.5.11")
+	if err != nil {
+		t.Fatalf("parseVersion upstream error: %v", err)
+	}
+	// 1.5.11-fork.1 为 1.5.11 的预发布版本：上游更新应被判定为需要更新
+	if !needUpdate(forkRel, upstream) {
+		t.Errorf("needUpdate(1.5.11-fork.1, 1.5.11) = false, want true")
+	}
+	if needUpdate(upstream, forkRel) {
+		t.Errorf("needUpdate(1.5.11, 1.5.11-fork.1) = true, want false")
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"syscall"
 
 	"github.com/komari-monitor/komari-agent/dnsresolver"
+	"github.com/komari-monitor/komari-agent/monitoring/netstatic"
 	monitoring "github.com/komari-monitor/komari-agent/monitoring/unit"
 	"github.com/komari-monitor/komari-agent/server"
 	"github.com/komari-monitor/komari-agent/update"
@@ -25,11 +27,18 @@ import (
 
 var flags = pkg_flags.GlobalConfig
 
+var warningPanelHost, warningRunAsUser string
+
 var RootCmd = &cobra.Command{
 	Use:   "komari-agent",
 	Short: "komari agent",
 	Long:  `komari agent`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// Notification helpers must not load the service's config or credentials.
+		if flags.ShowWarning {
+			ShowToast()
+			return nil
+		}
 		loadFromEnv() // 从环境变量加载配置，覆盖解析
 		if flags.ConfigFile != "" {
 			bytes, err := os.ReadFile(flags.ConfigFile)
@@ -41,32 +50,45 @@ var RootCmd = &cobra.Command{
 				return fmt.Errorf("failed to parse config file: %w", err)
 			}
 		}
-		if flags.ProtocolVersion == 0 {
-			flags.ProtocolVersion = 2
-		}
 		if flags.PreferIPVersion != "" && flags.PreferIPVersion != "4" && flags.PreferIPVersion != "6" {
 			return fmt.Errorf("invalid --prefer-ip-version value %q: expected 4 or 6", flags.PreferIPVersion)
 		}
 		// 捕获中止信号，优雅退出
 		stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
+
+		stopWarning := startSecurityWarning(stopCtx)
+		defer stopWarning()
+		// 所有退出路径（signal/自更新重启）统一经 shutdown 收口，
+		// 包装 netstatic.Stop 保证退出前强制流量账本刷盘。
+		shutdown := newShutdownCoordinator(stopWarning, func() error {
+			monitoring.FlushTrafficLedger()
+			return netstatic.Stop()
+		}, os.Exit)
 		go func() {
 			<-stopCtx.Done()
 			log.Printf("shutting down gracefully...")
-			monitoring.FlushTrafficLedger()
-			os.Exit(0)
+			shutdown.shutdown(0)
 		}()
 
-		if flags.ShowWarning {
-			ShowToast()
-			os.Exit(0)
+		if flags.MonthRotate != 0 {
+			err := netstatic.StartOrContinue()
+			if err != nil {
+				log.Println("Failed to start netstatic monitoring:", err)
+			}
+			nics, err := monitoring.InterfaceList()
+			if err != nil {
+				log.Println("Failed to get interface list for netstatic:", err)
+			}
+			err = netstatic.SetNewConfig(netstatic.NetStaticConfig{
+				Nics: nics,
+			})
+			if err != nil {
+				log.Println("Failed to set netstatic config:", err)
+			}
 		}
 
-		if !flags.DisableWebSsh {
-			go WarnKomariRunning()
-		}
-
-		// update 包 os.Exit(42) 自更新退出前强制流量账本刷盘
+		// update 包自更新重启前（ErrRestartRequired 返回点）强制流量账本刷盘
 		update.RegisterPreExitHook(monitoring.FlushTrafficLedger)
 
 		log.Println("Komari Agent", update.CurrentVersion)
@@ -106,10 +128,12 @@ var RootCmd = &cobra.Command{
 		// 自动更新
 		if !flags.DisableAutoUpdate {
 			err := update.CheckAndUpdate()
-			if err != nil {
-				log.Println("[ERROR]", err)
+			if handleUpdateCheckResult(err, shutdown) {
+				return nil
 			}
-			go update.DoUpdateWorks()
+			go update.DoUpdateWorks(func() {
+				shutdown.shutdown(42)
+			})
 		}
 		go server.DoUploadBasicInfoWorks()
 		for {
@@ -117,6 +141,17 @@ var RootCmd = &cobra.Command{
 			server.EstablishWebSocketConnection()
 		}
 	},
+}
+
+func handleUpdateCheckResult(err error, shutdown *shutdownCoordinator) bool {
+	if errors.Is(err, update.ErrRestartRequired) {
+		shutdown.shutdown(42)
+		return true
+	}
+	if err != nil {
+		log.Println("[ERROR]", err)
+	}
+	return false
 }
 
 func Execute() {
@@ -163,11 +198,14 @@ func init() {
 	RootCmd.PersistentFlags().StringVar(&flags.CustomDNS, "custom-dns", "", "Custom DNS server to use (e.g. 8.8.8.8, 114.114.114.114). By default, the program uses the system DNS resolver.")
 	RootCmd.PersistentFlags().BoolVar(&flags.EnableGPU, "gpu", false, "Enable detailed GPU monitoring (usage, memory, multi-GPU support)")
 	RootCmd.PersistentFlags().BoolVar(&flags.ShowWarning, "show-warning", false, "Show security warning on Windows, run once as a subprocess")
+	RootCmd.PersistentFlags().StringVar(&warningPanelHost, "warning-panel-host", "", "Panel host shown by the notification helper")
+	RootCmd.PersistentFlags().StringVar(&warningRunAsUser, "warning-run-as-user", "", "Agent account shown by the notification helper")
+	_ = RootCmd.PersistentFlags().MarkHidden("warning-panel-host")
+	_ = RootCmd.PersistentFlags().MarkHidden("warning-run-as-user")
 	RootCmd.PersistentFlags().StringVar(&flags.CustomIpv4, "custom-ipv4", "", "Custom IPv4 address to use")
 	RootCmd.PersistentFlags().StringVar(&flags.CustomIpv6, "custom-ipv6", "", "Custom IPv6 address to use")
 	RootCmd.PersistentFlags().BoolVar(&flags.GetIpAddrFromNic, "get-ip-addr-from-nic", false, "Get IP address from network interface")
 	RootCmd.PersistentFlags().StringVar(&flags.ConfigFile, "config", "", "Path to the configuration file")
-	RootCmd.PersistentFlags().IntVar(&flags.ProtocolVersion, "protocol-version", 2, "Report protocol version (1 or 2)")
 	RootCmd.PersistentFlags().BoolVar(&flags.DisableCompression, "disable-compression", false, "Disable v2 gzip/permessage-deflate compression")
 	RootCmd.PersistentFlags().StringVar(&flags.PreferIPVersion, "prefer-ip-version", "", "Prefer IP version for dashboard connections: 4 or 6")
 	RootCmd.PersistentFlags().StringVar(&flags.TrafficStateFile, "traffic-state-file", "", "Path to the traffic ledger state file (default: traffic-state.json next to the resolved executable)")
