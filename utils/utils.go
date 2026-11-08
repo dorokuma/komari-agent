@@ -35,24 +35,17 @@ func GetLastResetDate(resetDay int, currentDate time.Time) time.Time {
 	return getActualResetDate(prevYear, prevMonth, resetDay, currentDate.Location())
 }
 
-// getActualResetDate 获取某月的实际重置日期（考虑顺延）
-// 如果该月没有指定的日期，则顺延到下个月1日
+// getActualResetDate 获取某月的实际重置日期
+// 如果该月没有指定的日期，则夹紧到该月最后一天零点，
+// 避免顺延到下个月1日导致相邻两月在同一天双重置。
 func getActualResetDate(year int, month time.Month, resetDay int, location *time.Location) time.Time {
 	// 获取该月的最后一天
 	firstDayOfNextMonth := time.Date(year, month+1, 1, 0, 0, 0, 0, location)
 	lastDayOfMonth := firstDayOfNextMonth.AddDate(0, 0, -1).Day()
 
-	// 如果该月有这个日期，返回该日期
-	if resetDay <= lastDayOfMonth {
-		return time.Date(year, month, resetDay, 0, 0, 0, 0, location)
+	// 如果该月没有这个日期，夹紧到该月最后一天
+	if resetDay > lastDayOfMonth {
+		resetDay = lastDayOfMonth
 	}
-
-	// 如果该月没有这个日期，顺延到下个月1日
-	nextMonth := month + 1
-	nextYear := year
-	if nextMonth > 12 {
-		nextMonth = 1
-		nextYear++
-	}
-	return time.Date(nextYear, nextMonth, 1, 0, 0, 0, 0, location)
+	return time.Date(year, month, resetDay, 0, 0, 0, 0, location)
 }

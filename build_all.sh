@@ -13,8 +13,22 @@ ARCH_LIST=("amd64" "arm64" "386" "arm")
 # 创建构建目录
 mkdir -p ./build
 
-# 获取当前版本
-VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "dev")
+# 获取当前版本：提取合法 SemVer tag，非合法 SemVer 或无 tag 回退 "0.0.1"；
+# 注入合法 SemVer 预发布版本号 "${BASE_VER}-fork.${SHORT_SHA}"，保证通过 update.parseVersion 校验。
+TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
+BASE_VER="0.0.1"
+if [ -n "$TAG" ]; then
+  CANDIDATE="${TAG#v}"
+  CANDIDATE="${CANDIDATE#V}"
+  if echo "$CANDIDATE" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+    BASE_VER="$CANDIDATE"
+  fi
+fi
+SHORT_SHA=$(git rev-parse --short HEAD 2>/dev/null || true)
+if [ -z "$SHORT_SHA" ]; then
+  SHORT_SHA="nogit"
+fi
+VERSION="${BASE_VER}-fork.${SHORT_SHA}"
 
 # 初始化失败列表
 FAILED_BUILDS=()

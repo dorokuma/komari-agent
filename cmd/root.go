@@ -15,7 +15,6 @@ import (
 	"syscall"
 
 	"github.com/komari-monitor/komari-agent/dnsresolver"
-	"github.com/komari-monitor/komari-agent/monitoring/netstatic"
 	monitoring "github.com/komari-monitor/komari-agent/monitoring/unit"
 	"github.com/komari-monitor/komari-agent/server"
 	"github.com/komari-monitor/komari-agent/update"
@@ -54,7 +53,7 @@ var RootCmd = &cobra.Command{
 		go func() {
 			<-stopCtx.Done()
 			log.Printf("shutting down gracefully...")
-			netstatic.Stop()
+			monitoring.FlushTrafficLedger()
 			os.Exit(0)
 		}()
 
@@ -67,22 +66,8 @@ var RootCmd = &cobra.Command{
 			go WarnKomariRunning()
 		}
 
-		if flags.MonthRotate != 0 {
-			err := netstatic.StartOrContinue()
-			if err != nil {
-				log.Println("Failed to start netstatic monitoring:", err)
-			}
-			nics, err := monitoring.InterfaceList()
-			if err != nil {
-				log.Println("Failed to get interface list for netstatic:", err)
-			}
-			err = netstatic.SetNewConfig(netstatic.NetStaticConfig{
-				Nics: nics,
-			})
-			if err != nil {
-				log.Println("Failed to set netstatic config:", err)
-			}
-		}
+		// update 包 os.Exit(42) 自更新退出前强制流量账本刷盘
+		update.RegisterPreExitHook(monitoring.FlushTrafficLedger)
 
 		log.Println("Komari Agent", update.CurrentVersion)
 		log.Println("Github Repo:", update.Repo)
@@ -161,7 +146,7 @@ func init() {
 	RootCmd.PersistentFlags().StringVarP(&flags.Endpoint, "endpoint", "e", "", "API endpoint")
 	//RootCmd.MarkPersistentFlagRequired("endpoint")
 	RootCmd.PersistentFlags().StringVar(&flags.AutoDiscoveryKey, "auto-discovery", "", "Auto discovery key for the agent")
-	RootCmd.PersistentFlags().BoolVar(&flags.DisableAutoUpdate, "disable-auto-update", false, "Disable automatic updates")
+	RootCmd.PersistentFlags().BoolVar(&flags.DisableAutoUpdate, "disable-auto-update", true, "Disable automatic updates")
 	RootCmd.PersistentFlags().BoolVar(&flags.DisableWebSsh, "disable-web-ssh", false, "Disable remote control(web ssh and rce)")
 	//RootCmd.PersistentFlags().BoolVar(&flags.MemoryModeAvailable, "memory-mode-available", false, "[deprecated]Report memory as available instead of used.")
 	RootCmd.PersistentFlags().Float64VarP(&flags.Interval, "interval", "i", 3.0, "Interval in seconds")
@@ -185,6 +170,7 @@ func init() {
 	RootCmd.PersistentFlags().IntVar(&flags.ProtocolVersion, "protocol-version", 2, "Report protocol version (1 or 2)")
 	RootCmd.PersistentFlags().BoolVar(&flags.DisableCompression, "disable-compression", false, "Disable v2 gzip/permessage-deflate compression")
 	RootCmd.PersistentFlags().StringVar(&flags.PreferIPVersion, "prefer-ip-version", "", "Prefer IP version for dashboard connections: 4 or 6")
+	RootCmd.PersistentFlags().StringVar(&flags.TrafficStateFile, "traffic-state-file", "", "Path to the traffic ledger state file (default: traffic-state.json next to the resolved executable)")
 	RootCmd.PersistentFlags().ParseErrorsWhitelist.UnknownFlags = true
 }
 
@@ -213,8 +199,11 @@ func loadFromEnv() {
 		case reflect.String:
 			field.SetString(envValue)
 		case reflect.Bool:
-			if strings.ToLower(envValue) == "true" || envValue == "1" {
+			switch strings.ToLower(envValue) {
+			case "true", "1":
 				field.SetBool(true)
+			case "false", "0":
+				field.SetBool(false)
 			}
 		case reflect.Int:
 			if intVal, err := strconv.Atoi(envValue); err == nil {
