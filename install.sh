@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 # Color definitions for terminal output
 RED='\033[0;31m'
@@ -35,12 +35,18 @@ log_config() {
     echo -e "${CYAN}[CONFIG]${NC} $1"
 }
 
+# $EUID 是 bash 专有变量, ash/dash 下未定义, 补 POSIX 回退
+EUID=${EUID:-$(id -u)}
+
 # Default values
 service_name="komari-agent"
 target_dir="/opt/komari"
 github_proxy=""
 install_version="" # New parameter for specifying version
- 
+install_dir_specified=false
+install_no_mirror=true # 安全收紧：默认禁用未验签的第三方加速镜像自动回退；--install-no-mirror 保留以兼容旧命令行（幂等）
+service_user="${SUDO_USER:-$(id -un)}"
+user_service=false
 
 # Detect OS
 os_type=$(uname -s)
@@ -72,10 +78,12 @@ esac
 
 # Parse install-specific arguments
 komari_args=""
-while [[ $# -gt 0 ]]; do
+# [[ ]] -> [ ] (POSIX)
+while [ $# -gt 0 ]; do
     case $1 in
         --install-dir)
             target_dir="$2"
+            install_dir_specified=true
             shift 2
             ;;
         --install-service-name)
@@ -89,6 +97,10 @@ while [[ $# -gt 0 ]]; do
         --install-version)
             install_version="$2"
             shift 2
+            ;;
+        --install-no-mirror) # 兼容选项：第三方镜像自动回退已默认禁用，此选项保持幂等
+            install_no_mirror=true
+            shift
             ;;
         --install*)
             log_warning "Unknown install parameter: $1"
@@ -105,19 +117,26 @@ done
 # Remove leading space from komari_args if present
 komari_args="${komari_args# }"
 
-komari_agent_path="${target_dir}/agent"
-
-# macOS doesn't always require sudo for everything
-if [ "$os_name" = "darwin" ] && command -v brew >/dev/null 2>&1; then
-    # On macOS with Homebrew, we can run without root for dependencies
-    require_root_for_deps=false
-else
-    require_root_for_deps=true
+# A direct, unprivileged installation belongs entirely to the invoking user.
+if [ "$EUID" -ne 0 ] && [ "$install_dir_specified" = false ]; then
+    case "$os_name" in
+        linux|freebsd)
+            target_dir="${XDG_DATA_HOME:-$HOME/.local/share}/komari"
+            ;;
+    esac
 fi
 
-if [ "$EUID" -ne 0 ] && [ "$require_root_for_deps" = true ]; then
-    log_error "Please run as root"
-    exit 1
+komari_agent_path="${target_dir}/agent"
+
+# User services are the only service type a non-root Linux installation can manage.
+if [ "$EUID" -ne 0 ] && [ "$os_name" = "linux" ]; then
+    if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+        user_service=true
+    else
+        log_error "A non-root Linux installation requires a running systemd user session"
+        log_info "Log in through systemd or install with elevated privileges."
+        exit 1
+    fi
 fi
 
 echo -e "${WHITE}===========================================${NC}"
@@ -126,8 +145,9 @@ echo -e "${WHITE}===========================================${NC}"
 echo ""
 log_config "Installation configuration:"
 log_config "  Service name: ${GREEN}$service_name${NC}"
+log_config "  Service user: ${GREEN}$service_user${NC}"
 log_config "  Install directory: ${GREEN}$target_dir${NC}"
-log_config "  GitHub proxy: ${GREEN}${github_proxy:-"(direct)"}${NC}"
+log_config "  GitHub proxy: ${GREEN}${github_proxy:-(direct)}${NC}"
 log_config "  Binary arguments: ${GREEN}$komari_args${NC}"
 if [ -n "$install_version" ]; then
     log_config "  Specified agent version: ${GREEN}$install_version${NC}"
@@ -141,7 +161,15 @@ uninstall_previous() {
     log_step "Checking for previous installation..."
     
     # Stop and disable service if it exists
-    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q "${service_name}.service"; then
+    if [ "$user_service" = true ]; then
+        if systemctl --user list-unit-files | grep -q "${service_name}.service"; then
+            log_info "Stopping and disabling existing systemd user service..."
+            systemctl --user stop "${service_name}.service" || true
+            systemctl --user disable "${service_name}.service" || true
+            rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/${service_name}.service"
+            systemctl --user daemon-reload
+        fi
+    elif command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q "${service_name}.service"; then
         log_info "Stopping and disabling existing systemd service..."
         systemctl stop ${service_name}.service
         systemctl disable ${service_name}.service
@@ -201,6 +229,11 @@ install_dependencies() {
     done
 
     if [ -n "$missing_deps" ]; then
+        if [ "$EUID" -ne 0 ]; then
+            log_error "Missing required dependencies:$missing_deps"
+            log_info "Install them with your system package manager, then run this script again."
+            exit 1
+        fi
         # Check package manager and install dependencies
         if command -v apt >/dev/null 2>&1; then
             log_info "Using apt to install dependencies..."
@@ -212,11 +245,15 @@ install_dependencies() {
         elif command -v apk >/dev/null 2>&1; then
             log_info "Using apk to install dependencies..."
             apk add $missing_deps
+        elif command -v opkg >/dev/null 2>&1; then # OpenWrt / iStoreOS
+            log_info "Using opkg to install dependencies (OpenWrt/iStoreOS)..."
+            opkg update
+            opkg install $missing_deps
         elif command -v brew >/dev/null 2>&1; then
             log_info "Using Homebrew to install dependencies..."
             brew install $missing_deps
         else
-            log_error "No supported package manager found (apt/yum/apk/brew)"
+            log_error "No supported package manager found (apt/yum/apk/opkg/brew)"
             exit 1
         fi
         
@@ -247,6 +284,9 @@ case $arch in
         ;;
     aarch64|arm64)
         arch="arm64"
+        ;;
+    loongarch64|loong64)
+        arch="loong64"
         ;;
     i386|i686)
         # x86 (32-bit) support
@@ -279,16 +319,62 @@ case $arch in
 esac
 log_info "Detected OS: ${GREEN}$os_name${NC}, Architecture: ${GREEN}$arch${NC}"
 
+file_name="komari-agent-${os_name}-${arch}"
+
+resolve_snapshot_version() {
+    snapshot_api_url="https://api.github.com/repos/dorokuma/komari-agent/releases?per_page=100"
+    if [ -n "$github_proxy" ]; then
+        snapshot_api_urls="${github_proxy}/${snapshot_api_url} ${snapshot_api_url}"
+    else
+        snapshot_api_urls="$snapshot_api_url"
+    fi
+
+    for api_url in $snapshot_api_urls; do
+        if ! releases_json=$(curl -fsSL --connect-timeout 15 \
+            -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: komari-agent-installer" \
+            "$api_url"); then
+            releases_json=""
+        fi
+
+        if [ -n "$releases_json" ]; then
+            RESOLVED_SNAPSHOT_VERSION=$(printf '%s\n' "$releases_json" |
+                grep -o '"tag_name":[[:space:]]*"Snapshot-[^"]*"' |
+                sed 's/.*"\(Snapshot-[^"]*\)".*/\1/' |
+                LC_ALL=C sort -r |
+                head -n 1)
+            if [ -n "$RESOLVED_SNAPSHOT_VERSION" ]; then
+                return 0
+            fi
+        fi
+
+        if [ "$api_url" != "$snapshot_api_url" ]; then
+            log_warning "Failed to resolve snapshot releases through GitHub proxy, retrying directly."
+        fi
+    done
+
+    return 1
+}
+
 version_to_install="latest"
 if [ -n "$install_version" ]; then
-    log_info "Attempting to install specified version: ${GREEN}$install_version${NC}"
-    version_to_install="$install_version"
+    if [ "$install_version" = "snapshot" ]; then
+        log_info "Resolving the latest snapshot version..."
+        if ! resolve_snapshot_version; then
+            log_error "Failed to resolve the latest snapshot version."
+            exit 1
+        fi
+        version_to_install="$RESOLVED_SNAPSHOT_VERSION"
+        log_success "Latest snapshot version: ${GREEN}$version_to_install${NC}"
+    else
+        log_info "Attempting to install specified version: ${GREEN}$install_version${NC}"
+        version_to_install="$install_version"
+    fi
 else
     log_info "No version specified, installing the latest version."
 fi
 
 # Construct download URL
-file_name="komari-agent-${os_name}-${arch}"
 if [ "$version_to_install" = "latest" ]; then
     download_path="latest/download"
 else
@@ -297,30 +383,44 @@ fi
 
 if [ -n "$github_proxy" ]; then
     # Use proxy for GitHub releases
-    download_url="${github_proxy}/https://github.com/komari-monitor/komari-agent/releases/${download_path}/${file_name}"
+    download_url="${github_proxy}/https://github.com/dorokuma/komari-agent/releases/${download_path}/${file_name}"
 else
     # Direct access to GitHub releases
-    download_url="https://github.com/komari-monitor/komari-agent/releases/${download_path}/${file_name}"
+    download_url="https://github.com/dorokuma/komari-agent/releases/${download_path}/${file_name}"
 fi
 
 log_step "Creating installation directory: ${GREEN}$target_dir${NC}"
 mkdir -p "$target_dir"
-
-# Download binary
-if [ -n "$github_proxy" ]; then
-    log_step "Downloading $file_name via proxy..."
-    log_info "URL: ${CYAN}$download_url${NC}"
-else
-    log_step "Downloading $file_name directly..."
-    log_info "URL: ${CYAN}$download_url${NC}"
+if [ "$EUID" -eq 0 ] && [ "$service_user" != "root" ]; then
+    chown "$service_user" "$target_dir"
 fi
-if ! curl -L -o "$komari_agent_path" "$download_url"; then
+
+# 安全收紧：默认仅直连 GitHub 发布页（或显式 --install-ghproxy 指定的代理前缀），
+# 不再自动回退 ghfast.top / gh-proxy.com / ghproxy.net 等未验签的第三方公共加速镜像。
+download_urls="$download_url"
+
+dl_ok=""
+for u in $download_urls; do
+    log_step "Downloading $file_name ..."
+    log_info "URL: ${CYAN}$u${NC}"
+    if curl -fL --connect-timeout 15 -o "$komari_agent_path" "$u" && [ -s "$komari_agent_path" ]; then
+        dl_ok=1
+        break
+    fi
+    rm -f "$komari_agent_path"
+done
+
+if [ -z "$dl_ok" ]; then
     log_error "Download failed"
+    log_error "Retry later, or specify --install-ghproxy <mirror-prefix> to use an explicit mirror"
     exit 1
 fi
 
 # Set executable permissions
 chmod +x "$komari_agent_path"
+if [ "$EUID" -eq 0 ] && [ "$service_user" != "root" ]; then
+    chown "$service_user" "$komari_agent_path"
+fi
 log_success "Komari-agent installed to ${GREEN}$komari_agent_path${NC}"
 
 # Detect init system and configure service
@@ -416,6 +516,9 @@ detect_init_system() {
 }
 
 init_system=$(detect_init_system)
+if [ "$user_service" = true ]; then
+    init_system="systemd-user"
+fi
 log_info "Detected init system: ${GREEN}$init_system${NC}"
 
 # Handle each init system
@@ -432,7 +535,7 @@ if [ "$init_system" = "nixos" ]; then
     echo -e "${CYAN}    ExecStart = \"${komari_agent_path} ${komari_args}\";${NC}"
     echo -e "${CYAN}    WorkingDirectory = \"${target_dir}\";${NC}"
     echo -e "${CYAN}    Restart = \"always\";${NC}"
-    echo -e "${CYAN}    User = \"root\";${NC}"
+    echo -e "${CYAN}    User = \"${service_user}\";${NC}"
     echo -e "${CYAN}  };${NC}"
     echo -e "${CYAN}};${NC}"
     echo ""
@@ -449,7 +552,7 @@ name="Komari Agent Service"
 description="Komari monitoring agent"
 command="${komari_agent_path}"
 command_args="${komari_args}"
-command_user="root"
+command_user="${service_user}"
 directory="${target_dir}"
 pidfile="/run/${service_name}.pid"
 retry="SIGTERM/30"
@@ -466,6 +569,28 @@ EOF
     rc-update add ${service_name} default
     rc-service ${service_name} start
     log_success "OpenRC service configured and started"
+elif [ "$init_system" = "systemd-user" ]; then
+    log_info "Using systemd user service management"
+    service_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    service_file="${service_dir}/${service_name}.service"
+    mkdir -p "$service_dir"
+    cat > "$service_file" << EOF
+[Unit]
+Description=Komari Agent Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${komari_agent_path} ${komari_args}
+WorkingDirectory=${target_dir}
+Restart=always
+
+[Install]
+WantedBy=default.target
+EOF
+    systemctl --user daemon-reload
+    systemctl --user enable --now "${service_name}.service"
+    log_success "Systemd user service configured and started"
 elif [ "$init_system" = "systemd" ]; then
     # Systemd service configuration
     log_info "Using systemd for service management"
@@ -480,7 +605,7 @@ Type=simple
 ExecStart=${komari_agent_path} ${komari_args}
 WorkingDirectory=${target_dir}
 Restart=always
-User=root
+User=${service_user}
 
 [Install]
 WantedBy=multi-user.target
@@ -508,17 +633,20 @@ ARGS="${komari_args}"
 
 start_service() {
     procd_open_instance
-    procd_set_param command \$PROG \$ARGS
+    # 参数逐个追加, 避免整串拼接可能导致的引号/转义问题
+    procd_set_param command "\$PROG"
+    # shellcheck disable=SC2086
+    procd_append_param command \$ARGS
     procd_set_param respawn
     procd_set_param stdout 1
     procd_set_param stderr 1
-    procd_set_param user root
+    procd_set_param user ${service_user}
     procd_close_instance
 }
 
-stop_service() {
-    killall \$(basename \$PROG)
-}
+# 移除 killall 版 stop_service:
+# USE_PROCD=1 时 rc.common 默认 stop 会通过 procd 正确终止实例,
+# 按进程名 killall 反而可能误杀同名进程, 且无法阻止 respawn.
 
 reload_service() {
     stop
@@ -535,8 +663,14 @@ elif [ "$init_system" = "launchd" ]; then
     # macOS launchd service configuration
     log_info "Using launchd for service management"
     
-    # Determine if this should be a system or user service based on installation directory
-    if [[ "$target_dir" =~ ^/Users/.* ]] || [ "$EUID" -ne 0 ]; then
+    # [[ =~ ]] -> case (POSIX); 判定用户级还是系统级安装
+    is_user_install=false
+    case "$target_dir" in
+        /Users/*) is_user_install=true ;;
+    esac
+    [ "$EUID" -ne 0 ] && is_user_install=true
+    
+    if [ "$is_user_install" = true ]; then
         # User-level service (LaunchAgent)
         plist_dir="$HOME/Library/LaunchAgents"
         plist_file="$plist_dir/com.komari.${service_name}.plist"
@@ -549,7 +683,6 @@ elif [ "$init_system" = "launchd" ]; then
         plist_dir="/Library/LaunchDaemons"
         plist_file="$plist_dir/com.komari.${service_name}.plist"
         log_info "Installing as system-level service (LaunchDaemon)"
-        service_user="root"
         log_dir="/var/log"
     fi
     
@@ -590,7 +723,7 @@ EOF
 EOF
     
     # Load and start the service
-    if [[ "$target_dir" =~ ^/Users/.* ]] || [ "$EUID" -ne 0 ]; then
+    if [ "$is_user_install" = true ]; then
         # User-level service
         if launchctl bootstrap gui/$(id -u) "$plist_file"; then
             log_success "User-level launchd service configured and started"
@@ -625,6 +758,8 @@ umask 022
 
 console none
 
+setuid ${service_user}
+
 pre-start script
     test -x ${komari_agent_path} || { stop; exit 0; }
 end script
@@ -656,3 +791,5 @@ fi
 log_config "Service: ${GREEN}$service_name${NC}"
 log_config "Arguments: ${GREEN}$komari_args${NC}"
 echo -e "${WHITE}===========================================${NC}"
+
+

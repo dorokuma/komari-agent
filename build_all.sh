@@ -8,27 +8,50 @@ NC='\033[0m' # 无颜色
 
 # 定义操作系统和架构列表
 OS_LIST=("windows" "linux" "darwin" "freebsd")
-ARCH_LIST=("amd64" "arm64" "386" "arm")
+ARCH_LIST=("amd64" "arm64" "386" "arm" "loong64")
 
 # 创建构建目录
 mkdir -p ./build
 
-# 获取当前版本：提取合法 SemVer tag，非合法 SemVer 或无 tag 回退 "0.0.1"；
-# 注入合法 SemVer 预发布版本号 "${BASE_VER}-fork.${SHORT_SHA}"，保证通过 update.parseVersion 校验。
-TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
-BASE_VER="0.0.1"
-if [ -n "$TAG" ]; then
-  CANDIDATE="${TAG#v}"
-  CANDIDATE="${CANDIDATE#V}"
-  if echo "$CANDIDATE" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-    BASE_VER="$CANDIDATE"
-  fi
-fi
+# 获取当前版本：同时支持上游纯 SemVer tag（1.5.11 / v1.5.11）与我方 Fork 发版 tag
+#（v1.5.11-fork.1 / 1.5.11-fork.1）。纯数字短 SHA（如 0123456）在 SemVer 预发布段
+# 属非法前导零，故 SHA 前缀固定加 "g"；Fork 发版 tag 用 +g<sha> 构建元数据溯源。
 SHORT_SHA=$(git rev-parse --short HEAD 2>/dev/null || true)
 if [ -z "$SHORT_SHA" ]; then
   SHORT_SHA="nogit"
 fi
-VERSION="${BASE_VER}-fork.${SHORT_SHA}"
+RE_FORK_TAG='^[0-9]+\.[0-9]+\.[0-9]+-fork\.[0-9]+$'
+RE_SEMVER='^[0-9]+\.[0-9]+\.[0-9]+$'
+
+EXACT_TAG=$(git describe --tags --exact-match HEAD 2>/dev/null || true)
+if [ -n "$EXACT_TAG" ]; then
+  CANDIDATE="${EXACT_TAG#v}"
+  CANDIDATE="${CANDIDATE#V}"
+  if echo "$CANDIDATE" | grep -qE "$RE_FORK_TAG"; then
+    # 我方 Fork 发版 tag：完整展示 1.5.11-fork.1 并附 +g<sha> 构建溯源
+    VERSION="${CANDIDATE}+g${SHORT_SHA}"
+  elif echo "$CANDIDATE" | grep -qE "$RE_SEMVER"; then
+    # 上游纯 SemVer tag
+    VERSION="${CANDIDATE}-fork.g${SHORT_SHA}"
+  else
+    VERSION="0.0.1-fork.g${SHORT_SHA}"
+  fi
+else
+  TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
+  if [ -n "$TAG" ]; then
+    CANDIDATE="${TAG#v}"
+    CANDIDATE="${CANDIDATE#V}"
+    if echo "$CANDIDATE" | grep -qE "$RE_FORK_TAG"; then
+      VERSION="${CANDIDATE}.dev.g${SHORT_SHA}"
+    elif echo "$CANDIDATE" | grep -qE "$RE_SEMVER"; then
+      VERSION="${CANDIDATE}-fork.g${SHORT_SHA}"
+    else
+      VERSION="0.0.1-fork.g${SHORT_SHA}"
+    fi
+  else
+    VERSION="0.0.1-fork.g${SHORT_SHA}"
+  fi
+fi
 
 # 初始化失败列表
 FAILED_BUILDS=()
@@ -36,9 +59,10 @@ FAILED_BUILDS=()
 # 遍历操作系统和架构组合
 for GOOS in "${OS_LIST[@]}"; do
   for GOARCH in "${ARCH_LIST[@]}"; do
-    # 排除 windows/arm, darwin/386 和 darwin/arm
+    # 排除仅由 Linux 支持的 loong64，以及 windows/arm、darwin/386 和 darwin/arm
     if { [ "$GOOS" = "windows" ] && [ "$GOARCH" = "arm" ]; } || \
-       { [ "$GOOS" = "darwin" ] && { [ "$GOARCH" = "386" ] || [ "$GOARCH" = "arm" ]; }; }; then
+       { [ "$GOOS" = "darwin" ] && { [ "$GOARCH" = "386" ] || [ "$GOARCH" = "arm" ]; }; } || \
+       { [ "$GOOS" != "linux" ] && [ "$GOARCH" = "loong64" ]; }; then
       continue
     fi
 

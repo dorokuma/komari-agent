@@ -2,6 +2,7 @@ package update
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,19 +20,21 @@ import (
 	"github.com/rhysd/go-github-selfupdate/selfupdate"
 )
 
+var ErrRestartRequired = errors.New("update installed; restart required")
+
 var (
 	CurrentVersion string = "0.0.1"
-	Repo           string = "komari-monitor/komari-agent"
+	Repo           string = "dorokuma/komari-agent"
 )
 
-// preExitHook os.Exit(42) 前的回调钩子（由 cmd 注册流量账本刷盘等清理），
-// 避免 update 反向依赖 monitoring 造成包循环。preExitHookMu 保护注册与读取。
+// preExitHook 自更新成功后退出/重启前的回调钩子（由 cmd 注册流量账本刷盘等
+// 清理），避免 update 反向依赖 monitoring 造成包循环。preExitHookMu 保护注册与读取。
 var (
 	preExitHook   func()
 	preExitHookMu sync.Mutex
 )
 
-// RegisterPreExitHook 注册 os.Exit(42) 前执行的回调；重复注册取最后一次。
+// RegisterPreExitHook 注册自更新重启前执行的回调；重复注册取最后一次。
 func RegisterPreExitHook(hook func()) {
 	preExitHookMu.Lock()
 	defer preExitHookMu.Unlock()
@@ -86,6 +89,14 @@ type snapshotReleaseCandidate struct {
 	PublishedAt time.Time
 	Asset       githubReleaseAsset
 }
+
+type selfUpdater interface {
+	DetectLatest(slug string) (*selfupdate.Release, bool, error)
+	UpdateTo(release *selfupdate.Release, cmdPath string) error
+}
+
+type releaseLister func(owner, repo string) ([]githubRelease, error)
+type containerCheck func() bool
 
 // parseVersion 解析可能带有 v/V 前缀，以及预发布或构建元数据的版本字符串
 func parseVersion(ver string) (semver.Version, error) {
@@ -263,22 +274,46 @@ func selfUpdateReleaseFromSnapshot(owner, repo string, candidate snapshotRelease
 	}
 }
 
-func DoUpdateWorks() {
+func DoUpdateWorks(onRestartRequired func()) {
 	ticker_ := time.NewTicker(time.Duration(6) * time.Hour)
-	for range ticker_.C {
-		CheckAndUpdate()
+	defer ticker_.Stop()
+	runScheduledUpdates(ticker_.C, CheckAndUpdate, onRestartRequired)
+}
+
+func runScheduledUpdates(ticks <-chan time.Time, check func() error, onRestartRequired func()) {
+	for range ticks {
+		if errors.Is(check(), ErrRestartRequired) {
+			if onRestartRequired != nil {
+				onRestartRequired()
+			}
+			return
+		}
 	}
 }
 
-func checkAndUpdateStable(currentSemVer semver.Version, updater *selfupdate.Updater) error {
-	latest, err := updater.UpdateSelf(currentSemVer, Repo)
+func checkAndUpdateStable(currentSemVer semver.Version, updater selfUpdater, execPathFn func() (string, error)) error {
+	latest, found, err := updater.DetectLatest(Repo)
 	if err != nil {
 		return fmt.Errorf("failed to check for updates: %v", err)
 	}
 
-	if latest.Version.Equals(currentSemVer) {
+	// UpdateTo would blindly replace the binary. Gate on direction so that a
+	// newer local build (dev/snapshot suffix or higher base version) is never
+	// downgraded to an older released tag. Build metadata (+g<sha>) is ignored
+	// by semver comparison, so tag-equal rebuilds also count as latest.
+	if !found || !needUpdate(currentSemVer, latest.Version) {
 		log.Println("Current version is the latest:", CurrentVersion)
 		return nil
+	}
+
+	cmdPath, err := execPathFn()
+	if err != nil {
+		return fmt.Errorf("failed to resolve current executable path: %w", err)
+	}
+
+	log.Printf("Will update %s from version %s to %s\n", cmdPath, CurrentVersion, latest.Version)
+	if err := updater.UpdateTo(latest, cmdPath); err != nil {
+		return fmt.Errorf("failed to update to version %s: %w", latest.Version, err)
 	}
 	// Default is installed as a service, so don't automatically restart
 	//execPath, err := os.Executable()
@@ -294,12 +329,11 @@ func checkAndUpdateStable(currentSemVer semver.Version, updater *selfupdate.Upda
 	// }
 	log.Printf("Successfully updated to version %s\n", latest.Version)
 	runPreExitHook()
-	os.Exit(42)
-	return nil
+	return ErrRestartRequired
 }
 
-func checkAndUpdateSnapshot(updater *selfupdate.Updater) error {
-	if isContainerAgent() {
+func checkAndUpdateSnapshot(updater selfUpdater, listReleases releaseLister, isContainer containerCheck) error {
+	if isContainer() {
 		log.Println("Snapshot agent is running in a container; skip binary self-update. Refresh the ghcr.io image tagged 'snapshot' instead.")
 		return nil
 	}
@@ -309,7 +343,7 @@ func checkAndUpdateSnapshot(updater *selfupdate.Updater) error {
 		return err
 	}
 
-	releases, err := listGitHubReleases(owner, repo)
+	releases, err := listReleases(owner, repo)
 	if err != nil {
 		return err
 	}
@@ -338,8 +372,7 @@ func checkAndUpdateSnapshot(updater *selfupdate.Updater) error {
 
 	log.Printf("Successfully updated to snapshot version %s\n", latest.TagName)
 	runPreExitHook()
-	os.Exit(42)
-	return nil
+	return ErrRestartRequired
 }
 
 // 检查更新并执行自动更新
@@ -353,7 +386,7 @@ func CheckAndUpdate() error {
 	}
 
 	if detectBuildTrack(CurrentVersion) == snapshotTrack {
-		return checkAndUpdateSnapshot(updater)
+		return checkAndUpdateSnapshot(updater, listGitHubReleases, isContainerAgent)
 	}
 
 	currentSemVer, err := parseVersion(CurrentVersion)
@@ -361,5 +394,5 @@ func CheckAndUpdate() error {
 		return fmt.Errorf("failed to parse current version: %v", err)
 	}
 
-	return checkAndUpdateStable(currentSemVer, updater)
+	return checkAndUpdateStable(currentSemVer, updater, currentExecutablePath)
 }
