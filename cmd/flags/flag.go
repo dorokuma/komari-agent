@@ -29,7 +29,12 @@ type Config struct {
 	ProtocolVersion     int     `json:"protocol_version" env:"AGENT_PROTOCOL_VERSION"`             // 上报协议版本，默认2
 	DisableCompression  bool    `json:"disable_compression" env:"AGENT_DISABLE_COMPRESSION"`       // 禁用v2传输压缩
 	PreferIPVersion     string  `json:"prefer_ip_version" env:"AGENT_PREFER_IP_VERSION"`           // 面板连接优先使用的 IP 版本：4 或 6
+	TrafficStateFile    string  `json:"traffic_state_file" env:"AGENT_TRAFFIC_STATE_FILE"`         // 流量账本状态文件路径，默认为可执行文件同目录 traffic-state.json
 
 }
 
-var GlobalConfig = &Config{}
+var GlobalConfig = &Config{
+	// fork 定制：默认禁用向官方仓自动更新，防止未传参数节点覆盖定制版；
+	// 仍可通过 CLI/env/JSON 显式开启。
+	DisableAutoUpdate: true,
+}

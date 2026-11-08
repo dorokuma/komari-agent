@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/blang/semver"
@@ -22,6 +23,29 @@ var (
 	CurrentVersion string = "0.0.1"
 	Repo           string = "komari-monitor/komari-agent"
 )
+
+// preExitHook os.Exit(42) 前的回调钩子（由 cmd 注册流量账本刷盘等清理），
+// 避免 update 反向依赖 monitoring 造成包循环。preExitHookMu 保护注册与读取。
+var (
+	preExitHook   func()
+	preExitHookMu sync.Mutex
+)
+
+// RegisterPreExitHook 注册 os.Exit(42) 前执行的回调；重复注册取最后一次。
+func RegisterPreExitHook(hook func()) {
+	preExitHookMu.Lock()
+	defer preExitHookMu.Unlock()
+	preExitHook = hook
+}
+
+func runPreExitHook() {
+	preExitHookMu.Lock()
+	hook := preExitHook
+	preExitHookMu.Unlock()
+	if hook != nil {
+		hook()
+	}
+}
 
 const (
 	snapshotVersionPrefix = "Snapshot-"
@@ -269,6 +293,7 @@ func checkAndUpdateStable(currentSemVer semver.Version, updater *selfupdate.Upda
 	// 	return fmt.Errorf("failed to restart program: %v", err)
 	// }
 	log.Printf("Successfully updated to version %s\n", latest.Version)
+	runPreExitHook()
 	os.Exit(42)
 	return nil
 }
@@ -312,6 +337,7 @@ func checkAndUpdateSnapshot(updater *selfupdate.Updater) error {
 	}
 
 	log.Printf("Successfully updated to snapshot version %s\n", latest.TagName)
+	runPreExitHook()
 	os.Exit(42)
 	return nil
 }

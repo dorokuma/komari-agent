@@ -1,6 +1,6 @@
 ---
-status: active # active | superseded
-superseded_by: ""
+status: superseded # active | superseded
+superseded_by: "fork-delta.md"
 supersedes: ""
 模块: "monitoring, server" # 可选模块: cmd, dnsresolver, monitoring, protocol, server, terminal, update, utils, ws
 ---
