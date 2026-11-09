@@ -14,3 +14,6 @@ config.json
 traffic-state.json
 traffic-state.json.corrupt
 .agents/notes/INDEX.md
+
+# 本机全局 ignore 排除了 AGENTS.md，本仓需入库跟踪
+!/AGENTS.md
