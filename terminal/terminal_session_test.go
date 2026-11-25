@@ -391,87 +391,75 @@ func TestCloseSessionTerminatesLocalPTY(t *testing.T) {
 func TestExpiryCallbackNeverKillsResumedSession(t *testing.T) {
 	resetAgentSessions(t)
 	setAgentTestTiming(t, 40*time.Millisecond, 5*time.Second, 5*time.Second, time.Second)
-	gracefulShutdownEnabled.Store(false)
-	t.Cleanup(func() { gracefulShutdownEnabled.Store(true) })
 
-	// Deterministic interleaving: the browser resume strictly precedes the
-	// timer callback's close attempt. This is exactly the TOCTOU window the
-	// reviewer documented — the old code validated the generation, released
-	// the lock, then unconditionally closed; the resume landed in between and
-	// was killed anyway. The fixed close path re-validates generation inside
-	// the atomic critical section and must bail out.
+	// Single-round deterministic scenario pinned on the timerGen comparison:
+	// abort arms gen 1 -> resume (stops timer, bumps gen) -> abort re-arms
+	// gen 2 -> a stale gen-1 callback must be rejected while the newer
+	// retention timer survives; the matching gen-2 callback must close.
+	// This distinguishes a correct generation comparison from a degraded
+	// implementation that merely checks timer == nil.
 	const id = "agent-expiry-race"
-	const rounds = 30
-	for round := 0; round < rounds; round++ {
-		roundID := id + "-" + strings.Repeat("x", round) + "-r"
-		pty := newFakePTY()
-		session := &terminalSession{id: roundID, term: pty}
-		sessionsMu.Lock()
-		sessions[roundID] = session
-		sessionsMu.Unlock()
+	pty := newFakePTY()
+	session := &terminalSession{id: id, term: pty}
+	sessionsMu.Lock()
+	sessions[id] = session
+	sessionsMu.Unlock()
 
-		// Capture the generation a pending timer callback would fire with.
-		session.mu.Lock()
-		session.browserDetached = true
-		session.startTimerLocked(time.Hour) // timer never fires; callback driven manually
-		staleGen := session.timerGen
-		session.mu.Unlock()
-
-		// Browser resumes before the callback runs: generation bumps, timer stops.
-		session.markBrowserActive()
-
-		// Now the stale callback executes its close path. It must observe the
-		// bumped generation inside the critical section and refuse to close.
-		closeSessionWithGen(roundID, session, true, &staleGen)
-		if !HasSession(roundID) {
-			t.Fatalf("round %d: stale-generation callback killed the resumed session", round)
-		}
-		if pty.isClosed() {
-			t.Fatalf("round %d: stale-generation callback closed the PTY of the resumed session", round)
-		}
-		session.mu.Lock()
-		if session.removed {
-			session.mu.Unlock()
-			t.Fatalf("round %d: stale-generation callback marked resumed session removed", round)
-		}
-		session.mu.Unlock()
-
-		// Explicitly close for the next round; with no expectedGen constraint
-		// this close must succeed even though generation moved on.
-		closeSession(roundID, session, false)
-		if HasSession(roundID) {
-			t.Fatalf("round %d: explicit closeSession failed to remove session", round)
-		}
-		if !pty.isClosed() {
-			t.Fatalf("round %d: explicit closeSession did not close PTY", round)
-		}
+	// First abort arms the retention timer at generation 1.
+	session.mu.Lock()
+	session.browserDetached = true
+	session.startTimerLocked(time.Hour) // never fires; callbacks driven manually
+	staleGen := session.timerGen
+	session.mu.Unlock()
+	if staleGen == 0 {
+		t.Fatal("arming the retention timer must bump timerGen above zero")
 	}
 
-	// Positive control: a close attempt carrying the *current* generation
-	// while the retention timer is still pending must succeed — the expiry
-	// callback is the legitimate owner of that generation.
-	{
-		const validID = "agent-expiry-race-valid-gen"
-		pty := newFakePTY()
-		session := &terminalSession{id: validID, term: pty}
-		sessionsMu.Lock()
-		sessions[validID] = session
-		sessionsMu.Unlock()
-		session.mu.Lock()
-		session.browserDetached = true
-		session.startTimerLocked(time.Hour)
-		gen := session.timerGen
-		session.mu.Unlock()
+	// Browser resumes: the timer is stopped and the generation bumps.
+	session.markBrowserActive()
 
-		closeSessionWithGen(validID, session, true, &gen)
-		if HasSession(validID) {
-			t.Fatal("matching-generation close was wrongly rejected")
-		}
-		if !pty.isClosed() {
-			t.Fatal("matching-generation close did not release the PTY")
-		}
+	// Browser drops again: a fresh timer is armed at a newer generation.
+	session.mu.Lock()
+	session.browserDetached = true
+	session.startTimerLocked(time.Hour)
+	currentGen := session.timerGen
+	currentTimer := session.timer
+	session.mu.Unlock()
+	if currentGen <= staleGen {
+		t.Fatalf("re-arming after resume must advance timerGen (stale=%d, current=%d)", staleGen, currentGen)
 	}
 
+	// The stale gen-1 callback fires late. It must observe the generation
+	// mismatch inside the critical section and leave the session untouched —
+	// crucially the re-armed timer must survive, which a timer==nil-only
+	// check cannot guarantee (it would see a non-nil timer and kill).
+	closeSessionWithGen(id, session, true, &staleGen)
+	if !HasSession(id) {
+		t.Fatal("stale-generation callback killed the re-armed session")
+	}
+	if pty.isClosed() {
+		t.Fatal("stale-generation callback closed the PTY of the re-armed session")
+	}
+	session.mu.Lock()
+	if session.removed {
+		session.mu.Unlock()
+		t.Fatal("stale-generation callback marked the session removed")
+	}
+	if session.timer == nil || session.timer != currentTimer {
+		session.mu.Unlock()
+		t.Fatal("stale-generation callback disturbed the live retention timer")
+	}
+	session.mu.Unlock()
+
+	// The matching gen-2 callback is the legitimate owner of this generation:
+	// it must close the session and release the PTY.
+	closeSessionWithGen(id, session, true, &currentGen)
+	if HasSession(id) {
+		t.Fatal("matching-generation close was wrongly rejected")
+	}
+	if !pty.isClosed() {
+		t.Fatal("matching-generation close did not release the PTY")
+	}
 }
 
 // TestCloseSessionReleasesResourcesWhenWriteBlocked verifies that even when a
@@ -481,8 +469,6 @@ func TestCloseSessionReleasesResourcesWhenWriteBlocked(t *testing.T) {
 	resetAgentSessions(t)
 	// A short write wait bounds how long the blocked writer can hold writeMu.
 	setAgentTestTiming(t, 5*time.Second, 5*time.Second, 5*time.Second, 100*time.Millisecond)
-	gracefulShutdownEnabled.Store(false)
-	t.Cleanup(func() { gracefulShutdownEnabled.Store(true) })
 
 	const id = "agent-close-write-blocked"
 	pty := newFakePTY()
@@ -500,12 +486,18 @@ func TestCloseSessionReleasesResourcesWhenWriteBlocked(t *testing.T) {
 	session.conn = client
 	session.mu.Unlock()
 
-	// Occupy writeMu with a large write that the peer never drains. It either
+	// Occupy writeMu with large writes that the peer never drains. The writer
 	// blocks in the kernel or fails fast via the write deadline — either way
-	// closeSession must not wait indefinitely.
+	// closeSession must not wait indefinitely. Only symbols that already
+	// exist in the pre-fix baseline (writeMu, writeMessage, closeSession,
+	// terminalWriteWait) are used, so this test double-snapshots FAIL on the
+	// baseline (blocked writeMu never releases, closeSession hangs) and PASS
+	// on the fixed tree.
 	big := make([]byte, 4*1024*1024)
+	writeStarted := make(chan struct{})
 	writeDone := make(chan struct{})
 	go func() {
+		close(writeStarted)
 		for i := 0; i < 64; i++ {
 			if err := session.writeMessage(client, websocket.BinaryMessage, big); err != nil {
 				break
@@ -513,9 +505,24 @@ func TestCloseSessionReleasesResourcesWhenWriteBlocked(t *testing.T) {
 		}
 		close(writeDone)
 	}()
+	<-writeStarted
 
-	// Let the writer get stuck in the first blocked write.
-	time.Sleep(20 * time.Millisecond)
+	// Wait until the writer is actually inside writeMessage holding writeMu
+	// before closing — otherwise the close could complete before the writer
+	// even starts, making the test vacuous.
+	muWait := time.Now().Add(2 * time.Second)
+	for {
+		locked := session.writeMu.TryLock()
+		if locked {
+			session.writeMu.Unlock()
+			if time.Now().After(muWait) {
+				t.Fatal("writer never acquired writeMu; test setup broken")
+			}
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		break
+	}
 
 	closeDone := make(chan struct{})
 	go func() {

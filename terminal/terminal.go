@@ -3,7 +3,6 @@ package terminal
 import (
 	"errors"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -439,7 +438,7 @@ func closeSessionWithGen(requestID string, expected *terminalSession, notifyPeer
 		return
 	}
 	session.removed = true
-	session.timer = nil
+	session.stopTimerLocked()
 	conn := session.conn
 	session.conn = nil
 	term := session.term
@@ -458,15 +457,6 @@ func closeSessionWithGen(requestID string, expected *terminalSession, notifyPeer
 	_ = gracefulClose(term)
 }
 
-// gracefulShutdownEnabled 决定是否执行向 PTY 写入 Ctrl-C/Ctrl-D/exit 的
-// 优雅退出序列；测试可关闭以避免 fakePTY 上的固定 sleep 拖慢用例。
-// 原子访问：关闭路径在异步协程中执行，与测试主协程并发。
-var gracefulShutdownEnabled atomic.Bool
-
-func init() {
-	gracefulShutdownEnabled.Store(true)
-}
-
 func gracefulClose(term Terminal) error {
 	gracefulShutdown(term)
 	return term.Close()
@@ -474,9 +464,6 @@ func gracefulClose(term Terminal) error {
 
 // gracefulShutdown 尝试优雅地关闭终端
 func gracefulShutdown(term Terminal) {
-	if !gracefulShutdownEnabled.Load() {
-		return
-	}
 	for i := 0; i < 3; i++ {
 		if _, err := term.Write([]byte{3}); err != nil {
 			return
