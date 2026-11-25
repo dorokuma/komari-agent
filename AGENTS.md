@@ -14,7 +14,7 @@
 
 ## 红线与部署边界
 - **流量账本状态文件禁叶级软链**：`monitoring/unit/traffic_ledger.go`（`:442-459`、`:529-536`、`:676-713`）的 `loadTrafficLedgerLocked` 用 `os.Lstat` 拒绝叶路径符号链接，该次启动转入冷初始化，首次原子 `Rename` 落盘会将软链替换为常规文件。运维跨盘重定向流量账本时必须软链父目录而非状态文件本体。
-- **远程控制默认禁用边界**：现网部署统一加 `--disable-web-ssh` 关闭远程终端与文件管理。上游原生 `terminal/terminal.go` 断线重连计时器竞态已于 2026-11-25 同步上游 `0be05ea`（`timerGen` 定时世代、404 速停与 `tty` 关闭修复）修复；若未来在任意节点开启远程控制，仍须先评估修复 `server/files.go:305,333-358` 异名同 inode 硬链接复制截断问题（另外容器仅设 `cpuset.cpus.effective` 未设 `cpu.max` 时 `monitoring/unit/cpu.go:250-266` 仍回退整机在线核数）。
+- **远程控制默认禁用边界**：现网部署统一加 `--disable-web-ssh` 关闭远程终端与文件管理。上游原生 `terminal/terminal.go` 断线重连计时器竞态已于 2026-11-25 同步上游 `0be05ea`（`timerGen` 定时世代、404 速停与 `tty` 关闭修复）并叠加 Fork 加固闭环：定时器到期回调与恢复路径的 TOCTOU 竞态已由世代原子校验的 `closeSessionWithGen` 修复、WebSocket 数据帧/控制帧写均已设有限写超时避免 `writeMu` 活性死锁；`agent.startupConfig` 回传已对 `token`/`auto_discovery_key` 脱敏且在途并发受限，`--disable-web-ssh` 下终端拨号至多单次交付 terminate 绝不进入 5 分钟重试、空 `request_id` 直接拒绝。若未来在任意节点开启远程控制，仍须先评估修复 `terminal/terminal_unix.go` 中 `pty.Setsize` 触发 `SetBlocking` 导致后台逃逸 pgid 子进程持有从端时 PTY 主端 FD/`readOutput` 协程泄漏，以及 `server/files.go:305,333-358` 异名同 inode 硬链接复制截断问题（另外容器仅设 `cpuset.cpus.effective` 未设 `cpu.max` 时 `monitoring/unit/cpu.go:250-266` 仍回退整机在线核数）。
 
 ## 索引指针
 - 项目文档：[readme.md](readme.md)

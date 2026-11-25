@@ -383,3 +383,160 @@ func TestCloseSessionTerminatesLocalPTY(t *testing.T) {
 		t.Fatal("PTY was not closed by CloseSession")
 	}
 }
+
+// TestExpiryCallbackNeverKillsResumedSession deterministically drives the
+// interleaving where the retention timer fires while the browser resumes the
+// session: the stale-generation timer callback must never remove a session
+// that has been reactivated (markBrowserActive / acquireSession reattach).
+func TestExpiryCallbackNeverKillsResumedSession(t *testing.T) {
+	resetAgentSessions(t)
+	setAgentTestTiming(t, 40*time.Millisecond, 5*time.Second, 5*time.Second, time.Second)
+	gracefulShutdownEnabled.Store(false)
+	t.Cleanup(func() { gracefulShutdownEnabled.Store(true) })
+
+	// Deterministic interleaving: the browser resume strictly precedes the
+	// timer callback's close attempt. This is exactly the TOCTOU window the
+	// reviewer documented — the old code validated the generation, released
+	// the lock, then unconditionally closed; the resume landed in between and
+	// was killed anyway. The fixed close path re-validates generation inside
+	// the atomic critical section and must bail out.
+	const id = "agent-expiry-race"
+	const rounds = 30
+	for round := 0; round < rounds; round++ {
+		roundID := id + "-" + strings.Repeat("x", round) + "-r"
+		pty := newFakePTY()
+		session := &terminalSession{id: roundID, term: pty}
+		sessionsMu.Lock()
+		sessions[roundID] = session
+		sessionsMu.Unlock()
+
+		// Capture the generation a pending timer callback would fire with.
+		session.mu.Lock()
+		session.browserDetached = true
+		session.startTimerLocked(time.Hour) // timer never fires; callback driven manually
+		staleGen := session.timerGen
+		session.mu.Unlock()
+
+		// Browser resumes before the callback runs: generation bumps, timer stops.
+		session.markBrowserActive()
+
+		// Now the stale callback executes its close path. It must observe the
+		// bumped generation inside the critical section and refuse to close.
+		closeSessionWithGen(roundID, session, true, &staleGen)
+		if !HasSession(roundID) {
+			t.Fatalf("round %d: stale-generation callback killed the resumed session", round)
+		}
+		if pty.isClosed() {
+			t.Fatalf("round %d: stale-generation callback closed the PTY of the resumed session", round)
+		}
+		session.mu.Lock()
+		if session.removed {
+			session.mu.Unlock()
+			t.Fatalf("round %d: stale-generation callback marked resumed session removed", round)
+		}
+		session.mu.Unlock()
+
+		// Explicitly close for the next round; with no expectedGen constraint
+		// this close must succeed even though generation moved on.
+		closeSession(roundID, session, false)
+		if HasSession(roundID) {
+			t.Fatalf("round %d: explicit closeSession failed to remove session", round)
+		}
+		if !pty.isClosed() {
+			t.Fatalf("round %d: explicit closeSession did not close PTY", round)
+		}
+	}
+
+	// Positive control: a close attempt carrying the *current* generation
+	// while the retention timer is still pending must succeed — the expiry
+	// callback is the legitimate owner of that generation.
+	{
+		const validID = "agent-expiry-race-valid-gen"
+		pty := newFakePTY()
+		session := &terminalSession{id: validID, term: pty}
+		sessionsMu.Lock()
+		sessions[validID] = session
+		sessionsMu.Unlock()
+		session.mu.Lock()
+		session.browserDetached = true
+		session.startTimerLocked(time.Hour)
+		gen := session.timerGen
+		session.mu.Unlock()
+
+		closeSessionWithGen(validID, session, true, &gen)
+		if HasSession(validID) {
+			t.Fatal("matching-generation close was wrongly rejected")
+		}
+		if !pty.isClosed() {
+			t.Fatal("matching-generation close did not release the PTY")
+		}
+	}
+
+}
+
+// TestCloseSessionReleasesResourcesWhenWriteBlocked verifies that even when a
+// data-frame write is blocked behind writeMu backpressure, closeSession still
+// closes the WebSocket connection and releases the PTY instead of hanging.
+func TestCloseSessionReleasesResourcesWhenWriteBlocked(t *testing.T) {
+	resetAgentSessions(t)
+	// A short write wait bounds how long the blocked writer can hold writeMu.
+	setAgentTestTiming(t, 5*time.Second, 5*time.Second, 5*time.Second, 100*time.Millisecond)
+	gracefulShutdownEnabled.Store(false)
+	t.Cleanup(func() { gracefulShutdownEnabled.Store(true) })
+
+	const id = "agent-close-write-blocked"
+	pty := newFakePTY()
+	session := &terminalSession{id: id, term: pty}
+	sessionsMu.Lock()
+	sessions[id] = session
+	sessionsMu.Unlock()
+
+	client, server := newAgentWSPair(t)
+	// The server side never reads, creating TCP backpressure; the 100ms write
+	// deadline in writeJSON/writeMessage guarantees the write side errors out
+	// instead of hanging forever.
+	_ = server
+	session.mu.Lock()
+	session.conn = client
+	session.mu.Unlock()
+
+	// Occupy writeMu with a large write that the peer never drains. It either
+	// blocks in the kernel or fails fast via the write deadline — either way
+	// closeSession must not wait indefinitely.
+	big := make([]byte, 4*1024*1024)
+	writeDone := make(chan struct{})
+	go func() {
+		for i := 0; i < 64; i++ {
+			if err := session.writeMessage(client, websocket.BinaryMessage, big); err != nil {
+				break
+			}
+		}
+		close(writeDone)
+	}()
+
+	// Let the writer get stuck in the first blocked write.
+	time.Sleep(20 * time.Millisecond)
+
+	closeDone := make(chan struct{})
+	go func() {
+		closeSession(id, session, true)
+		close(closeDone)
+	}()
+
+	select {
+	case <-closeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("closeSession hung behind blocked writeMu; PTY/connection resources leaked")
+	}
+	if HasSession(id) {
+		t.Fatal("session still present after closeSession under write pressure")
+	}
+	if !pty.isClosed() {
+		t.Fatal("PTY was not closed by closeSession under write pressure")
+	}
+	select {
+	case <-writeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked writer never observed connection close")
+	}
+}

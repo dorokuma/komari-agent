@@ -3,6 +3,7 @@ package terminal
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -243,6 +244,9 @@ func startConnKeepalive(conn *websocket.Conn) (stop func(), refreshReadDeadline 
 				return
 			case <-ticker.C:
 				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeWait)); err != nil {
+					// Ping 写超时说明底层写已被背压卡死：主动关闭连接，
+					// 中断阻塞中的数据帧写并触发读循环退出，避免会话半死不活。
+					_ = conn.Close()
 					return
 				}
 			}
@@ -337,12 +341,19 @@ func (s *terminalSession) readOutput() {
 func (s *terminalSession) writeMessage(conn *websocket.Conn, messageType int, data []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	// 数据帧写会覆写底层 net.Conn 写截止：必须在持有 writeMu 期间显式设置
+	// 有限写超时，否则半开连接/TCP 零窗口背压会让 writeMu 被无限期占用，
+	// 阻塞到期清理与终止通知，最终泄漏 PTY 与协程。
+	_, _, _, writeWait := getTerminalTiming()
+	_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
 	return conn.WriteMessage(messageType, data)
 }
 
 func (s *terminalSession) writeJSON(conn *websocket.Conn, v interface{}) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	_, _, _, writeWait := getTerminalTiming()
+	_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
 	return conn.WriteJSON(v)
 }
 
@@ -354,13 +365,7 @@ func (s *terminalSession) startTimerLocked(retention time.Duration) {
 	gen := s.timerGen
 	s.timerDeadline = time.Now().Add(retention)
 	s.timer = time.AfterFunc(retention, func() {
-		s.mu.Lock()
-		if s.removed || s.timerGen != gen {
-			s.mu.Unlock()
-			return
-		}
-		s.mu.Unlock()
-		closeSession(s.id, s, true)
+		closeSessionWithGen(s.id, s, true, &gen)
 	})
 }
 
@@ -408,37 +413,58 @@ func (s *terminalSession) detach(conn *websocket.Conn) {
 }
 
 func closeSession(requestID string, expected *terminalSession, notifyPeer bool) {
+	closeSessionWithGen(requestID, expected, notifyPeer, nil)
+}
+
+// closeSessionWithGen 在 sessionsMu -> session.mu 一致锁序的同一临界区内
+// 核验会话身份、存活状态及（可选）定时器世代，核验通过后立即提交
+// removed 并删除 map 项，随后才释放锁执行网络/PTY 关闭 I/O。
+// 定时器到期回调必须传入触发时的世代：浏览器在到期边界恢复会话后
+// timerGen 已递增，旧世代回调绝不允许误杀已恢复的会话。
+func closeSessionWithGen(requestID string, expected *terminalSession, notifyPeer bool, expectedGen *uint64) {
 	if expected == nil {
 		return
 	}
 	sessionsMu.Lock()
 	session := sessions[requestID]
-	if session == nil || session != expected {
+	if session != expected {
 		sessionsMu.Unlock()
 		return
 	}
-	delete(sessions, requestID)
-	sessionsMu.Unlock()
-
 	session.mu.Lock()
-	if session.removed {
+	if session.removed ||
+		(expectedGen != nil && (session.timerGen != *expectedGen || session.timer == nil)) {
 		session.mu.Unlock()
+		sessionsMu.Unlock()
 		return
 	}
 	session.removed = true
-	session.stopTimerLocked()
+	session.timer = nil
 	conn := session.conn
 	session.conn = nil
 	term := session.term
+	delete(sessions, requestID)
 	session.mu.Unlock()
+	sessionsMu.Unlock()
 
 	if conn != nil {
 		if notifyPeer {
+			// terminate 通知失败/超时不允许阻塞 conn.Close 与 PTY 释放：
+			// writeJSON 持有 writeMu 且有有限写超时兜底。
 			_ = session.writeJSON(conn, controlMessage{Type: controlTypeTerminate})
 		}
 		_ = conn.Close()
 	}
 	_ = gracefulClose(term)
+}
+
+// gracefulShutdownEnabled 决定是否执行向 PTY 写入 Ctrl-C/Ctrl-D/exit 的
+// 优雅退出序列；测试可关闭以避免 fakePTY 上的固定 sleep 拖慢用例。
+// 原子访问：关闭路径在异步协程中执行，与测试主协程并发。
+var gracefulShutdownEnabled atomic.Bool
+
+func init() {
+	gracefulShutdownEnabled.Store(true)
 }
 
 func gracefulClose(term Terminal) error {
@@ -448,6 +474,9 @@ func gracefulClose(term Terminal) error {
 
 // gracefulShutdown 尝试优雅地关闭终端
 func gracefulShutdown(term Terminal) {
+	if !gracefulShutdownEnabled.Load() {
+		return
+	}
 	for i := 0; i < 3; i++ {
 		if _, err := term.Write([]byte{3}); err != nil {
 			return
