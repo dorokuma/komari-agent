@@ -14,7 +14,7 @@
 
 ## 红线与部署边界
 - **流量账本状态文件禁叶级软链**：`monitoring/unit/traffic_ledger.go`（`:442-459`、`:529-536`、`:676-713`）的 `loadTrafficLedgerLocked` 用 `os.Lstat` 拒绝叶路径符号链接，该次启动转入冷初始化，首次原子 `Rename` 落盘会将软链替换为常规文件。运维跨盘重定向流量账本时必须软链父目录而非状态文件本体。
-- **远程控制默认禁用边界**：现网部署统一加 `--disable-web-ssh` 关闭远程终端与文件管理。若未来在任意节点开启远程控制，须先评估修复上游原生 `terminal/terminal.go:103-112,193-228` 断线重连计时器竞态与 `server/files.go:305,333-358` 异名同 inode 硬链接复制截断问题（另外容器仅设 `cpuset.cpus.effective` 未设 `cpu.max` 时 `monitoring/unit/cpu.go:250-266` 仍回退整机在线核数）。
+- **远程控制默认禁用边界**：现网部署统一加 `--disable-web-ssh` 关闭远程终端与文件管理。上游原生 `terminal/terminal.go` 断线重连计时器竞态已于 2026-11-25 同步上游 `0be05ea`（`timerGen` 定时世代、404 速停与 `tty` 关闭修复）修复；若未来在任意节点开启远程控制，仍须先评估修复 `server/files.go:305,333-358` 异名同 inode 硬链接复制截断问题（另外容器仅设 `cpuset.cpus.effective` 未设 `cpu.max` 时 `monitoring/unit/cpu.go:250-266` 仍回退整机在线核数）。
 
 ## 索引指针
 - 项目文档：[readme.md](readme.md)

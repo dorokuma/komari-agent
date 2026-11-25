@@ -17,6 +17,12 @@ supersedes: ""
 
 基线版本：已于 2026-11-08 由 `1.2.60` 同步至上游 `1.5.11`（worktree `chore/sync-upstream-1.5.11` 合并）。
 
+2026-11-25 增量同步（worktree `chore/sync-upstream-fork-2`，拟发版 `v1.5.11-fork.2`）：按拓扑顺序原样 cherry-pick 上游 `main` 全部 9 条推荐提交——`6d68c72`（CI/Release 构建 `-ldflags` 追加 `-s -w` 裁剪体积）、`1068ad8`（新增 `agent.startupConfig` 启动配置查询，配合服务端流量配置探测；`CaptureStartupConfig` 按上游设计原样回传完整 `GlobalConfig`，属只读查询不受 `--disable-web-ssh` 拦截）、`828afaf`（`install.ps1` 空格路径提权与 `nssm` 引号修复）、`d990cce`（Linux 优先读 `/proc/uptime`，LXC 容器上报自身运行时长；账本代际判定走自有 `kernelUptimeSeconds` 不受影响）、`a4e7142`+`0b2b18d`+`0be05ea`（终端 WebSocket 文本帧控制协议、`writeMu` 并发修复、`timerGen` 定时世代防续命竞态、404 速停与 `tty` 关闭修复，三者成组连入，其中 `0be05ea` 修复了 AGENTS.md 此前点名的上游原生 `terminal/terminal.go` 断线重连计时器竞态）、`a959cc4`+`edfd9c0`（NVIDIA GPU 小数温度解析与 `float64` 精度保留；跨仓顺序约束：须待服务端 `komari-server` 合入 `618534f` 后再升级开启 `--gpu` 的节点）。
+
+**本次显式跳过 2 条上游提交**：
+- `e69081a`（`fix(netstatic): warn when the statistics file cannot be written`）：本仓流量统计已由 `traffic_ledger.go` 接管（默认落盘 `<可执行文件同目录>/traffic-state.json` 且自带 60s 节流错误日志），但 `cmd/root.go` 在 `MonthRotate != 0` 时仍保留调用遗留 `netstatic.StartOrContinue()`；`e69081a` 会在启动时按相对工作目录探测 `./net_static.json.probe`——systemd 以默认 `WorkingDirectory=/` 运行 `/opt/komari/komari-agent` 时，真实账本读写正常却会打印「重启后月度流量将丢失」的假阳性告警，并在可写工作目录下产生多余探测写入，故跳过。
+- `30e0ad5`（切换版本协议 `agent.switchVersion`）：新 `selectLatestStableRelease` 对含预发布段的版本在非精确目标下一律跳过，我方发版 Tag `vX.Y.Z-fork.N` 在 `blang/semver` 下 `Pre` 非空，合入后稳定版自更新将找不到任何 fork 版本；且该提交覆盖 `update/update.go` 会冲掉我方 `Repo = "dorokuma/komari-agent"`、`RegisterPreExitHook` 流量账本退出前刷盘回调及 `update_test.go` 自研单测；本仓默认 `DisableAutoUpdate = true` 且现网统一 `--disable-web-ssh`（`switchAgentVersion` 入口即被拒），无实际收益，故跳过。另 4 条上游 Merge 节点（`2561df5`/`ddbdbdc`/`aa42bea`/`efe34d5`）按线性 cherry-pick 惯例跳过。
+
 ## 决策
 
 当前与上游已知分歧点如下：
