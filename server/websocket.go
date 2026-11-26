@@ -10,6 +10,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -24,9 +25,11 @@ import (
 )
 
 var (
-	v2AckMu       sync.Mutex
-	v2AckEventIDs []string
-	v2SeenEvents  = make(map[string]time.Time)
+	v2AckMu        sync.Mutex
+	v2AckEventIDs  []string
+	v2SeenEvents   = make(map[string]time.Time)
+	terminalDialMu sync.Mutex
+	terminalDials  = make(map[string]struct{})
 )
 
 const (
@@ -183,7 +186,7 @@ func runV2PullLoop(ctx context.Context) {
 		pullID := fmt.Sprintf("pull-%d", time.Now().UnixNano())
 		ackIDs := snapshotV2AckEventIDs()
 		payload := v2.NewRequest(pullID, v2.MethodAgentPull, map[string]interface{}{
-			"capabilities":  []string{"exec", "ping", "message", "event", "terminal", "file"},
+			"capabilities":  []string{"exec", "ping", "message", "event", "terminal", "file", "startup_config"},
 			"ack_event_ids": ackIDs,
 		})
 		resp, err := postV2RequestContext(ctx, payload)
@@ -398,6 +401,11 @@ func processV2Event(conn *ws.SafeConn, method string, params interface{}, eventI
 			RequestID string `json:"request_id"`
 		}
 		if err := v2.BindParams(params, &p); err == nil {
+			// 空 request_id 会绕过 terminalDials 去重且无法定位会话，拒绝以防 DoS。
+			if strings.TrimSpace(p.RequestID) == "" {
+				log.Print("bad v2 terminal params: empty request_id")
+				return false
+			}
 			go establishTerminalConnection(flags.Token, p.RequestID, flags.Endpoint)
 			return true
 		} else {
@@ -414,6 +422,13 @@ func processV2Event(conn *ws.SafeConn, method string, params interface{}, eventI
 		} else {
 			log.Printf("bad v2 file params: %v", err)
 		}
+	case v2.MethodAgentStartupConfig:
+		var p v2.StartupConfigParams
+		if err := v2.BindParams(params, &p); err == nil && p.RequestID != "" {
+			go handleStartupConfig(p)
+			return true
+		}
+		log.Print("bad v2 startup configuration params")
 	default:
 		log.Printf("unknown v2 event method %s", method)
 	}
@@ -424,7 +439,24 @@ func processV2Event(conn *ws.SafeConn, method string, params interface{}, eventI
 
 // establishTerminalConnection 建立终端连接并使用terminal包处理终端操作
 func establishTerminalConnection(token, id, endpoint string) {
-	endpoint = strings.TrimSuffix(endpoint, "/") + "/api/clients/terminal?token=" + token + "&id=" + id
+	// 空 request_id 无法定位会话且会绕过拨号去重，直接拒绝。
+	if strings.TrimSpace(id) == "" {
+		return
+	}
+	terminalDialMu.Lock()
+	if _, active := terminalDials[id]; active {
+		terminalDialMu.Unlock()
+		return
+	}
+	terminalDials[id] = struct{}{}
+	terminalDialMu.Unlock()
+	defer func() {
+		terminalDialMu.Lock()
+		delete(terminalDials, id)
+		terminalDialMu.Unlock()
+	}()
+
+	endpoint = strings.TrimSuffix(endpoint, "/") + "/api/clients/terminal?token=" + token + "&id=" + url.QueryEscape(id)
 	endpoint = "ws" + strings.TrimPrefix(endpoint, "http")
 
 	// 转换中文域名为 ASCII 兼容编码
@@ -434,19 +466,88 @@ func establishTerminalConnection(token, id, endpoint string) {
 		log.Printf("Warning: Failed to convert Terminal WebSocket IDN to ASCII: %v", err)
 	}
 
-	// 使用与主 WS 相同的拨号策略
-	dialer := newWSDialer()
+	// 会话保留期间持续重试，避免一次临时网络失败让终端请求永久丢失。
+	const retryWindow = 5 * time.Minute
+	deadline := time.Now().Add(retryWindow)
+	established := false
+	for time.Now().Before(deadline) {
+		dialer := newWSDialer()
+		conn, resp, err := dialer.Dial(endpoint, nil)
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if err != nil {
+			if resp != nil && isTerminalPermanentReject(resp.StatusCode) {
+				log.Printf("Terminal session %s rejected by server (%s), closing local session", id, resp.Status)
+				terminal.CloseSession(id)
+				return
+			}
+			if flags.DisableWebSsh {
+				// 远程控制已禁用：首个拨号失败即退出，绝不进入 5 分钟重试风暴。
+				return
+			}
+			if established && !terminal.HasSession(id) {
+				return
+			}
+			log.Println("Failed to establish terminal connection, retrying in 15s:", err)
+			wait := 15 * time.Second
+			if remaining := time.Until(deadline); remaining < wait {
+				wait = remaining
+			}
+			if wait > 0 {
+				time.Sleep(wait)
+			}
+			continue
+		}
 
-	conn, _, err := dialer.Dial(endpoint, nil)
-	if err != nil {
-		log.Println("Failed to establish terminal connection:", err)
-		return
+		if flags.DisableWebSsh {
+			// 远程控制已禁用：至多单次拨号交付 terminate 后立刻退出，
+			// 绝不进入循环重试；非 101 状态由上层 err 分支处理。
+			terminal.StartTerminal(conn, id)
+			_ = conn.Close()
+			return
+		}
+
+		var retry bool
+		if established {
+			retry = terminal.ReattachTerminal(conn, id)
+		} else {
+			established = true
+			retry = terminal.StartTerminal(conn, id)
+		}
+		_ = conn.Close()
+		if !retry {
+			break
+		}
+		// 严格对齐本地会话的保留截止时间：若会话处于浏览器挂起倒计时中，不因
+		// 反复断连而无限延长重试窗口；正常活跃连接断线则获得完整 5 分钟窗口。
+		if sessionDeadline, ok := terminal.SessionDeadline(id); ok {
+			deadline = sessionDeadline
+		} else if !terminal.HasSession(id) {
+			shortDeadline := time.Now().Add(5 * time.Second)
+			if shortDeadline.Before(deadline) {
+				deadline = shortDeadline
+			}
+		} else {
+			deadline = time.Now().Add(retryWindow)
+		}
+		// 会话已建连后因对端断线返回 retry，短暂间隔后即可重连，不必等满 15s。
+		wait := 2 * time.Second
+		if remaining := time.Until(deadline); remaining < wait {
+			wait = remaining
+		}
+		if wait > 0 {
+			time.Sleep(wait)
+		}
 	}
+}
 
-	// 启动终端
-	terminal.StartTerminal(conn, id)
-	if conn != nil {
-		conn.Close()
+func isTerminalPermanentReject(statusCode int) bool {
+	switch statusCode {
+	case http.StatusNotFound, http.StatusUnauthorized, http.StatusForbidden, http.StatusGone:
+		return true
+	default:
+		return false
 	}
 }
 
